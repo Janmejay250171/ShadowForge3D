@@ -388,7 +388,14 @@ void verify_all_5_levels(LevelManager& levelManager, Sculpture& sculpture,
 static void saveScreenshotBMP(const char* filename, int w, int h) {
     std::vector<unsigned char> pixels(w * h * 4);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+#ifdef GL_BGRA
     glReadPixels(0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, pixels.data());
+#else
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+        std::swap(pixels[i], pixels[i+2]);
+    }
+#endif
 
     unsigned char fileHeader[14] = {
         'B', 'M',

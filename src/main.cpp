@@ -73,12 +73,60 @@ float rotationX = 0.0f;
 float rotationY = 0.0f;
 float rotationZ = 0.0f;
 
+// 3D Sculpture World-Space Orientation Matrix
+// Eliminates Gimbal Lock completely by pre-multiplying incremental rotations around screen/world axes
+Matrix4 g_currentOrientation = Matrix4::identity();
+
 // Normalize rotation angle to [0, 360) in exact integer degrees
 inline float norm360(float a) {
     float v = std::fmod(std::round(a), 360.0f);
     if (v < 0.0f) v += 360.0f;
     if (v >= 360.0f) v = 0.0f;
     return v;
+}
+
+// Orthonormalize 3x3 rotation columns to ensure zero numerical drift over time
+inline void orthonormalize(Matrix4& m) {
+    glm::vec3 c0(m.at(0, 0), m.at(1, 0), m.at(2, 0));
+    glm::vec3 c1(m.at(0, 1), m.at(1, 1), m.at(2, 1));
+
+    float l0 = glm::length(c0);
+    if (l0 > 1e-5f) c0 /= l0;
+
+    c1 = c1 - glm::dot(c1, c0) * c0;
+    float l1 = glm::length(c1);
+    if (l1 > 1e-5f) c1 /= l1;
+
+    glm::vec3 c2 = glm::cross(c0, c1);
+
+    m.at(0, 0) = c0.x; m.at(1, 0) = c0.y; m.at(2, 0) = c0.z;
+    m.at(0, 1) = c1.x; m.at(1, 1) = c1.y; m.at(2, 1) = c1.z;
+    m.at(0, 2) = c2.x; m.at(1, 2) = c2.y; m.at(2, 2) = c2.z;
+}
+
+// Extract canonical Euler angles for HUD presentation
+inline void updateEulerFromOrientation(const Matrix4& m, float& outX, float& outY, float& outZ) {
+    float rz = std::asin(glm::clamp(m.at(1, 0), -1.0f, 1.0f));
+    float rx = std::atan2(-m.at(1, 2), m.at(1, 1));
+    float ry = std::atan2(-m.at(2, 0), m.at(0, 0));
+    outX = norm360(glm::degrees(rx));
+    outY = norm360(glm::degrees(ry));
+    outZ = norm360(glm::degrees(rz));
+}
+
+// Apply discrete rotation step around world/screen axes
+inline void applyRotationStep(float dX, float dY, float dZ) {
+    if (std::abs(dY) > 1e-4f) {
+        g_currentOrientation = Matrix4::rotationY(glm::radians(dY)) * g_currentOrientation;
+    }
+    if (std::abs(dX) > 1e-4f) {
+        g_currentOrientation = Matrix4::rotationX(glm::radians(dX)) * g_currentOrientation;
+    }
+    if (std::abs(dZ) > 1e-4f) {
+        g_currentOrientation = Matrix4::rotationZ(glm::radians(dZ)) * g_currentOrientation;
+    }
+    orthonormalize(g_currentOrientation);
+    updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
 }
 
 // Shortest signed angular difference from current to target in [-180, +180]
@@ -91,21 +139,19 @@ inline float shortestAngleDiff(float cur, float target) {
 // KeyStepper: provides discrete 1° taps and smooth integer-degree hold repeat
 struct KeyStepper {
     int key;
-    float* anglePtr;
     float direction; // +1.0f or -1.0f
+    std::function<void(float step)> onStep;
     float holdTimer = 0.0f;
     float repeatTimer = 0.0f;
     bool wasDown = false;
 
     void update(GLFWwindow* window, float dt, bool isShift) {
         bool isDown = (glfwGetKey(window, key) == GLFW_PRESS);
-        float step = isShift ? 5.0f : 1.0f;
+        float step = (isShift ? 5.0f : 1.0f) * direction;
 
         if (isDown) {
             if (!wasDown) {
-                // Initial discrete tap: immediately snap to integer degree and step
-                float base = std::round(*anglePtr);
-                *anglePtr = norm360(base + direction * step);
+                if (onStep) onStep(step);
                 holdTimer = 0.0f;
                 repeatTimer = 0.0f;
             } else {
@@ -116,8 +162,7 @@ struct KeyStepper {
                     repeatTimer += dt;
                     while (repeatTimer >= REPEAT_INTERVAL) {
                         repeatTimer -= REPEAT_INTERVAL;
-                        float base = std::round(*anglePtr);
-                        *anglePtr = norm360(base + direction * step);
+                        if (onStep) onStep(step);
                     }
                 }
             }
@@ -343,6 +388,7 @@ void load_level(int levelIndex, LevelManager& levelManager, Sculpture& sculpture
     shadowMatcher.init(shadowProj.getTargetVertices());
 
     // 4. Reset orientation to default origin
+    g_currentOrientation = Matrix4::identity();
     rotX = 0.0f;
     rotY = 0.0f;
     rotZ = 0.0f;
@@ -638,13 +684,25 @@ int main() {
     int activeSliderAxis = -1;
     double lastMouseX = 0.0, lastMouseY = 0.0;
 
-    // Discrete 1° / hold-repeat KeySteppers for each axis
-    KeyStepper stepperA{ GLFW_KEY_A, &rotationX, -1.0f };
-    KeyStepper stepperD{ GLFW_KEY_D, &rotationX, +1.0f };
-    KeyStepper stepperW{ GLFW_KEY_W, &rotationY, +1.0f };
-    KeyStepper stepperS{ GLFW_KEY_S, &rotationY, -1.0f };
-    KeyStepper stepperQ{ GLFW_KEY_Q, &rotationZ, +1.0f };
-    KeyStepper stepperE{ GLFW_KEY_E, &rotationZ, -1.0f };
+    // Discrete 1° / hold-repeat KeySteppers for each axis (acting directly on world axes)
+    KeyStepper stepperA{ GLFW_KEY_A, -1.0f, [&](float step) {
+        applyRotationStep(step, 0.0f, 0.0f);
+    }};
+    KeyStepper stepperD{ GLFW_KEY_D, +1.0f, [&](float step) {
+        applyRotationStep(step, 0.0f, 0.0f);
+    }};
+    KeyStepper stepperW{ GLFW_KEY_W, +1.0f, [&](float step) {
+        applyRotationStep(0.0f, step, 0.0f);
+    }};
+    KeyStepper stepperS{ GLFW_KEY_S, -1.0f, [&](float step) {
+        applyRotationStep(0.0f, step, 0.0f);
+    }};
+    KeyStepper stepperQ{ GLFW_KEY_Q, +1.0f, [&](float step) {
+        applyRotationStep(0.0f, 0.0f, step);
+    }};
+    KeyStepper stepperE{ GLFW_KEY_E, -1.0f, [&](float step) {
+        applyRotationStep(0.0f, 0.0f, step);
+    }};
 
     // 8. Main Game Loop (Encapsulated for dual Native & WebAssembly execution)
     auto frameIteration = [&]() {
@@ -710,6 +768,7 @@ int main() {
                 gameState = GameState::PLAYING;
                 stateTimer = 0.0f;
             } else {
+                g_currentOrientation = Matrix4::identity();
                 rotationX = 0.0f;
                 rotationY = 0.0f;
                 rotationZ = 0.0f;
@@ -735,6 +794,7 @@ int main() {
                 manipulationMode = false;
                 gameState = GameState::PLAYING;
                 stateTimer = 0.0f;
+                g_currentOrientation = Matrix4::identity();
                 rotationX = 0.0f;
                 rotationY = 0.0f;
                 rotationZ = 0.0f;
@@ -779,15 +839,13 @@ int main() {
 
         if (isFDown && !wasFDown) {
             if (gameState == GameState::PLAYING) {
-                rotationX = curLvl.targetRotX;
-                rotationY = curLvl.targetRotY;
-                rotationZ = curLvl.targetRotZ;
+                g_currentOrientation = curLvl.getTargetMatrix();
+                updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
                 std::cout << "[F Debug Snap] Snapped to target orientation: Rx=" << rotationX 
                           << " Ry=" << rotationY << " Rz=" << rotationZ << std::endl;
             }
         }
         wasFDown = isFDown;
-
 
         // Keyboard rotation processing: Discrete 1° steps & integer-degree hold repeat
         if (gameState == GameState::PLAYING) {
@@ -800,10 +858,6 @@ int main() {
             stepperS.update(window, deltaTime, isShift);
             stepperQ.update(window, deltaTime, isShift);
             stepperE.update(window, deltaTime, isShift);
-
-            rotationX = norm360(rotationX);
-            rotationY = norm360(rotationY);
-            rotationZ = norm360(rotationZ);
         }
 
         // Mouse interaction for Manipulation Mode
@@ -815,6 +869,7 @@ int main() {
                 // 1. Reset Button: x in [-0.165, -0.055], y in [-0.595, -0.545]
                 if (mouseNdcX >= -0.165f && mouseNdcX <= -0.055f &&
                     mouseNdcY >= -0.595f && mouseNdcY <= -0.545f) {
+                    g_currentOrientation = Matrix4::identity();
                     rotationX = 0.0f;
                     rotationY = 0.0f;
                     rotationZ = 0.0f;
@@ -824,7 +879,6 @@ int main() {
 
                 // 2. Axis Controls (X, Y, Z)
                 float yCenters[3] = { -0.665f, -0.725f, -0.785f };
-                float* rotPtrs[3] = { &rotationX, &rotationY, &rotationZ };
                 bool isShift = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
                                 glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
                 float stepVal = isShift ? 5.0f : 1.0f; // Fine step: 1°, Coarse: 5° with Shift
@@ -834,20 +888,16 @@ int main() {
                     // Left button [-] (x in [-0.875, -0.835], y in [yC - 0.02, yC + 0.02])
                     if (mouseNdcX >= -0.875f && mouseNdcX <= -0.835f &&
                         mouseNdcY >= yC - 0.02f && mouseNdcY <= yC + 0.02f) {
-                        *rotPtrs[i] = norm360(std::round(*rotPtrs[i]) - stepVal);
+                        if (i == 0) applyRotationStep(-stepVal, 0.0f, 0.0f);
+                        else if (i == 1) applyRotationStep(0.0f, -stepVal, 0.0f);
+                        else if (i == 2) applyRotationStep(0.0f, 0.0f, -stepVal);
                     }
                     // Right button [+] (x in [-0.395, -0.355], y in [yC - 0.02, yC + 0.02])
                     else if (mouseNdcX >= -0.395f && mouseNdcX <= -0.355f &&
                              mouseNdcY >= yC - 0.02f && mouseNdcY <= yC + 0.02f) {
-                        *rotPtrs[i] = norm360(std::round(*rotPtrs[i]) + stepVal);
-                    }
-                    // Slider Track (x in [-0.81, -0.42], y in [yC - 0.015, yC + 0.015])
-                    else if (mouseNdcX >= -0.81f && mouseNdcX <= -0.42f &&
-                             mouseNdcY >= yC - 0.015f && mouseNdcY <= yC + 0.015f) {
-                        activeSliderAxis = i;
-                        float frac = glm::clamp((mouseNdcX - (-0.81f)) / (-0.42f - (-0.81f)), 0.0f, 1.0f);
-                        float newAng = std::round(frac * 360.0f);
-                        *rotPtrs[i] = norm360(newAng);
+                        if (i == 0) applyRotationStep(stepVal, 0.0f, 0.0f);
+                        else if (i == 1) applyRotationStep(0.0f, stepVal, 0.0f);
+                        else if (i == 2) applyRotationStep(0.0f, 0.0f, stepVal);
                     }
                 }
 
@@ -859,12 +909,7 @@ int main() {
             }
 
             if (isMouseDown) {
-                if (activeSliderAxis >= 0 && activeSliderAxis < 3) {
-                    float* rotPtrs[3] = { &rotationX, &rotationY, &rotationZ };
-                    float frac = glm::clamp((mouseNdcX - (-0.81f)) / (-0.42f - (-0.81f)), 0.0f, 1.0f);
-                    float newAng = std::round(frac * 360.0f);
-                    *rotPtrs[activeSliderAxis] = norm360(newAng);
-                } else if (isDraggingSculpture) {
+                if (isDraggingSculpture) {
                     float dx = static_cast<float>(mouseX - lastMouseX);
                     float dy = static_cast<float>(mouseY - lastMouseY);
                     const float MOUSE_SENSITIVITY = 0.35f; // degrees per pixel
@@ -879,7 +924,7 @@ int main() {
                         s_accumZ += dx * MOUSE_SENSITIVITY;
                         while (std::abs(s_accumZ) >= 1.0f) {
                             float step = (s_accumZ > 0.0f) ? 1.0f : -1.0f;
-                            rotationZ = norm360(rotationZ + step);
+                            applyRotationStep(0.0f, 0.0f, step);
                             s_accumZ -= step;
                         }
                     } else {
@@ -888,14 +933,14 @@ int main() {
                             s_accumY += dx * MOUSE_SENSITIVITY;
                             while (std::abs(s_accumY) >= 1.0f) {
                                 float step = (s_accumY > 0.0f) ? 1.0f : -1.0f;
-                                rotationY = norm360(rotationY + step);
+                                applyRotationStep(0.0f, step, 0.0f);
                                 s_accumY -= step;
                             }
                         } else {
                             s_accumX += dy * MOUSE_SENSITIVITY;
                             while (std::abs(s_accumX) >= 1.0f) {
                                 float step = (s_accumX > 0.0f) ? 1.0f : -1.0f;
-                                rotationX = norm360(rotationX + step);
+                                applyRotationStep(step, 0.0f, 0.0f);
                                 s_accumX -= step;
                             }
                         }
@@ -942,10 +987,7 @@ int main() {
             idleRotY += 18.0f * deltaTime;
             customModel = Matrix4::rotationY(glm::radians(idleRotY)) * Matrix4::rotationX(glm::radians(10.0f));
         } else {
-            Matrix4 rotX = Matrix4::rotationX(glm::radians(rotationX));
-            Matrix4 rotY = Matrix4::rotationY(glm::radians(rotationY));
-            Matrix4 rotZ = Matrix4::rotationZ(glm::radians(rotationZ));
-            customModel = rotY * rotZ * rotX;
+            customModel = g_currentOrientation;
         }
 
         // Update live 2D projected geometry from current 3D orientation
@@ -1144,7 +1186,8 @@ int main() {
             }
             // Level 1: Step Y to target 90 deg using real rotation
             else if (s_autoFrame == 18) {
-                rotationY = 90.0f; // Target for Level 1
+                g_currentOrientation = levelManager.getCurrentLevel().getTargetMatrix();
+                updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
             } else if (s_autoFrame == 20) {
                 std::cout << "[TEST RUN] Level 1 reached target (0, 90, 0): Match = " 
                           << matchScore << "% | State = " << (gameState == GameState::SUCCESS ? "SUCCESS" : "PLAYING") << std::endl;
@@ -1157,7 +1200,8 @@ int main() {
             }
             // Level 2: Step X to target 90 deg
             else if (s_autoFrame == 24) {
-                rotationX = 90.0f; // Target for Level 2
+                g_currentOrientation = levelManager.getCurrentLevel().getTargetMatrix();
+                updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
             } else if (s_autoFrame == 26) {
                 std::cout << "[TEST RUN] Level 2 reached target (90, 0, 0): Match = " 
                           << matchScore << "% | State = " << (gameState == GameState::SUCCESS ? "SUCCESS" : "PLAYING") << std::endl;
@@ -1170,8 +1214,8 @@ int main() {
             }
             // Level 3: Step X to 45, Y to 90
             else if (s_autoFrame == 30) {
-                rotationX = 45.0f;
-                rotationY = 90.0f; // Target for Level 3
+                g_currentOrientation = levelManager.getCurrentLevel().getTargetMatrix();
+                updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
             } else if (s_autoFrame == 32) {
                 std::cout << "[TEST RUN] Level 3 reached target (45, 90, 0): Match = " 
                           << matchScore << "% | State = " << (gameState == GameState::SUCCESS ? "SUCCESS" : "PLAYING") << std::endl;
@@ -1184,8 +1228,8 @@ int main() {
             }
             // Level 4: Step Y to 90, Z to 45
             else if (s_autoFrame == 36) {
-                rotationY = 90.0f;
-                rotationZ = 45.0f; // Target for Level 4
+                g_currentOrientation = levelManager.getCurrentLevel().getTargetMatrix();
+                updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
             } else if (s_autoFrame == 38) {
                 std::cout << "[TEST RUN] Level 4 reached target (0, 90, 45): Match = " 
                           << matchScore << "% | State = " << (gameState == GameState::SUCCESS ? "SUCCESS" : "PLAYING") << std::endl;
@@ -1198,9 +1242,8 @@ int main() {
             }
             // Level 5: Step X to 45, Y to 90, Z to 45
             else if (s_autoFrame == 42) {
-                rotationX = 45.0f;
-                rotationY = 90.0f;
-                rotationZ = 45.0f; // Target for Level 5
+                g_currentOrientation = levelManager.getCurrentLevel().getTargetMatrix();
+                updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
             } else if (s_autoFrame == 44) {
                 std::cout << "[TEST RUN] Level 5 reached target (45, 90, 45): Match = " 
                           << matchScore << "% | State = " << (gameState == GameState::SUCCESS ? "SUCCESS" : "PLAYING") << std::endl;
@@ -1222,9 +1265,8 @@ int main() {
             // Test Developer Key 'F' snap in real game loop
             else if (s_autoFrame == 50) {
                 const LevelInfo& l1 = levelManager.getCurrentLevel();
-                rotationX = l1.targetRotX;
-                rotationY = l1.targetRotY;
-                rotationZ = l1.targetRotZ;
+                g_currentOrientation = l1.getTargetMatrix();
+                updateEulerFromOrientation(g_currentOrientation, rotationX, rotationY, rotationZ);
                 std::cout << "[TEST RUN] Tested F key debug snap on Level 1" << std::endl;
             } else if (s_autoFrame == 52) {
                 std::cout << "[TEST RUN] F key snap produced: Match = " << matchScore 

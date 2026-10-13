@@ -9,7 +9,7 @@ out vec4 FragColor;
 
 // Rendering Mode: 0 = Unlit (for 2D silhouettes, HUD, UI), 1 = Lit 3D geometry
 uniform int uRenderMode;
-uniform float uAlpha = 1.0;
+uniform float uAlpha;
 
 void main()
 {

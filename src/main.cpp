@@ -137,6 +137,61 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     g_windowHeight = (height > 0) ? height : 1;
 }
 
+// Embedded shader fallbacks guaranteeing zero-failure shader initialization
+static const char* s_embeddedVertShader = R"(#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec3 aColor;
+
+out vec3 vColor;
+out vec3 vFragPos;
+
+uniform mat4 uModel;
+uniform mat4 uView;
+uniform mat4 uProjection;
+
+void main()
+{
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    gl_Position = uProjection * uView * worldPos;
+    vColor = aColor;
+    vFragPos = worldPos.xyz;
+}
+)";
+
+static const char* s_embeddedFragShader = R"(#version 330 core
+in vec3 vColor;
+in vec3 vFragPos;
+
+out vec4 FragColor;
+
+uniform int uRenderMode;
+uniform float uAlpha;
+
+void main()
+{
+    if (uRenderMode == 1) {
+        vec3 normal = normalize(cross(dFdx(vFragPos), dFdy(vFragPos)));
+        if (!gl_FrontFacing) {
+            normal = -normal;
+        }
+
+        vec3 keyDir = normalize(vec3(0.5, 0.9, 0.7));
+        float diffKey = max(dot(normal, keyDir), 0.0);
+
+        vec3 fillDir = normalize(vec3(-0.5, -0.2, -0.6));
+        float diffFill = max(dot(normal, fillDir), 0.0) * 0.25;
+
+        float ambient = 0.42;
+
+        vec3 litColor = vColor * (ambient + diffKey * 0.50 + diffFill);
+        FragColor = vec4(litColor, 1.0);
+    } else {
+        float alpha = (uAlpha > 0.0001) ? uAlpha : 1.0;
+        FragColor = vec4(vColor, alpha);
+    }
+}
+)";
+
 // Utility: Read shader source code from file with fallback path check
 std::string load_shader_source(const std::string& filepath) {
     std::ifstream file(filepath);
@@ -147,8 +202,18 @@ std::string load_shader_source(const std::string& filepath) {
             buffer << fallback.rdbuf();
             return buffer.str();
         }
-        std::cerr << "[Shader Error] Failed to open file: " << filepath << std::endl;
-        return "";
+        std::ifstream rootFallback("/" + filepath);
+        if (rootFallback.is_open()) {
+            std::stringstream buffer;
+            buffer << rootFallback.rdbuf();
+            return buffer.str();
+        }
+        std::cout << "[Shader Info] Using embedded fallback for: " << filepath << std::endl;
+        if (filepath.find("vert") != std::string::npos) {
+            return s_embeddedVertShader;
+        } else {
+            return s_embeddedFragShader;
+        }
     }
     std::stringstream buffer;
     buffer << file.rdbuf();
@@ -161,7 +226,7 @@ GLuint compile_shader(GLenum type, const std::string& source, const std::string&
 #ifdef __EMSCRIPTEN__
     size_t verPos = finalSource.find("#version 330 core");
     if (verPos != std::string::npos) {
-        finalSource.replace(verPos, 17, "#version 300 es\nprecision mediump float;\n");
+        finalSource.replace(verPos, 17, "#version 300 es\nprecision highp float;\nprecision highp int;\n");
     }
 #endif
     GLuint shader = glCreateShader(type);
@@ -175,6 +240,8 @@ GLuint compile_shader(GLenum type, const std::string& source, const std::string&
         char infoLog[512];
         glGetShaderInfoLog(shader, sizeof(infoLog), nullptr, infoLog);
         std::cerr << "[Shader Error] " << name << " compilation failed:\n" << infoLog << std::endl;
+        glDeleteShader(shader);
+        return 0;
     }
     return shader;
 }
@@ -192,6 +259,13 @@ GLuint create_shader_program(const std::string& vertPath, const std::string& fra
     GLuint vertShader = compile_shader(GL_VERTEX_SHADER, vertSource, "Vertex Shader");
     GLuint fragShader = compile_shader(GL_FRAGMENT_SHADER, fragSource, "Fragment Shader");
 
+    if (vertShader == 0 || fragShader == 0) {
+        std::cerr << "[Shader Error] Shader compilation failure aborting program creation." << std::endl;
+        if (vertShader != 0) glDeleteShader(vertShader);
+        if (fragShader != 0) glDeleteShader(fragShader);
+        return 0;
+    }
+
     GLuint program = glCreateProgram();
     glAttachShader(program, vertShader);
     glAttachShader(program, fragShader);
@@ -203,6 +277,10 @@ GLuint create_shader_program(const std::string& vertPath, const std::string& fra
         char infoLog[512];
         glGetProgramInfoLog(program, sizeof(infoLog), nullptr, infoLog);
         std::cerr << "[Shader Error] Program linking failed:\n" << infoLog << std::endl;
+        glDeleteProgram(program);
+        glDeleteShader(vertShader);
+        glDeleteShader(fragShader);
+        return 0;
     }
 
     glDeleteShader(vertShader);
